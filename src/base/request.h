@@ -19,6 +19,7 @@ struct Request {
     enum : int {
       Read = 0, 
       Write,
+      PimTP,
     };
   };
 
@@ -33,6 +34,13 @@ struct Request {
   Clk_t depart = -1;   // Clock cycle when the request depart the memory controller
 
   std::array<int, 4> scratchpad = { 0 };    // A scratchpad for the request
+
+  int pim_num_paths = 0;
+  int pim_dim_h = 0;
+  int pim_dim_e = 0;
+  int pim_dim_out = 0;
+  Clk_t pim_start = -1;
+  Clk_t pim_latency = 0;
 
   std::function<void(Request&)> callback;
 

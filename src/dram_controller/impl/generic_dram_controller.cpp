@@ -1,5 +1,8 @@
+#include <filesystem>
+
 #include "dram_controller/controller.h"
 #include "memory_system/memory_system.h"
+#include "spdlog/sinks/basic_file_sink.h"
 
 namespace Ramulator {
 
@@ -12,6 +15,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     ReqBuffer m_priority_buffer;          // Buffer for high-priority requests (e.g., maintenance like refresh).
     ReqBuffer m_read_buffer;              // Read request buffer
     ReqBuffer m_write_buffer;             // Write request buffer
+    ReqBuffer m_pim_buffer;               // PIM tensor product buffer
+    std::deque<Request> m_pim_pending;    // PIM requests that are executing
+
+    std::vector<Clk_t> m_pim_bank_busy_until;
+    int m_num_banks = 0;
 
     int m_bank_addr_idx = -1;
 
@@ -49,11 +57,31 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     size_t s_read_latency = 0;
     float s_avg_read_latency = 0;
 
+    size_t s_pim_tp_reqs = 0;
+    size_t s_pim_tp_cycles = 0;
+    size_t s_pim_tp_queue_len = 0;
+    float s_pim_tp_queue_len_avg = 0;
+
+    Clk_t m_pim_base_latency = 1;
+    Clk_t m_pim_k_outer = 1;
+    Clk_t m_pim_k_cg = 1;
+    Clk_t m_pim_k_scale = 1;
+
+    std::shared_ptr<spdlog::logger> m_pim_tracer;
+    std::string m_pim_trace_path;
+    uint64_t m_pim_trace_id = 0;
+
 
   public:
     void init() override {
       m_wr_low_watermark =  param<float>("wr_low_watermark").desc("Threshold for switching back to read mode.").default_val(0.2f);
       m_wr_high_watermark = param<float>("wr_high_watermark").desc("Threshold for switching to write mode.").default_val(0.8f);
+      m_pim_buffer.max_size = param<size_t>("pim_queue_size").desc("Max size of PIM TP queue.").default_val(1024);
+      m_pim_base_latency = param<int>("pim_base_latency").desc("Base latency for a PIM TP request.").default_val(1);
+      m_pim_k_outer = param<int>("pim_k_outer").desc("Cycles per multiply for outer product.").default_val(1);
+      m_pim_k_cg = param<int>("pim_k_cg").desc("Cycles per multiply for CG projection.").default_val(1);
+      m_pim_k_scale = param<int>("pim_k_scale").desc("Cycles per multiply for radial scaling.").default_val(1);
+      m_pim_trace_path = param<std::string>("pim_tp_trace_path").desc("Path to per-TP trace file. Empty disables.").default_val("");
 
       m_scheduler = create_child_ifce<IScheduler>();
       m_refresh = create_child_ifce<IRefreshManager>();    
@@ -65,12 +93,30 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           m_plugins.push_back(create_child_ifce<IControllerPlugin>(*it));
         }
       }
+
     };
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
       m_dram = memory_system->get_ifce<IDRAM>();
       m_bank_addr_idx = m_dram->m_levels("bank");
       m_priority_buffer.max_size = 512*3 + 32;
+      m_num_banks = m_dram->get_level_size("bank");
+      m_pim_bank_busy_until.assign(m_num_banks, 0);
+
+      if (!m_pim_trace_path.empty()) {
+        std::filesystem::path trace_path(m_pim_trace_path);
+        auto parent_path = trace_path.parent_path();
+        if (!parent_path.empty()) {
+          std::filesystem::create_directories(parent_path);
+        }
+        if (!parent_path.empty() && !std::filesystem::exists(parent_path)) {
+          throw ConfigurationError("Invalid path to trace file: {}", parent_path.string());
+        }
+        auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(fmt::format("{}.ch{}", m_pim_trace_path, m_channel_id), true);
+        m_pim_tracer = std::make_shared<spdlog::logger>(fmt::format("pim_tp_trace_ch{}", m_channel_id), sink);
+        m_pim_tracer->set_pattern("%v");
+        m_pim_tracer->set_level(spdlog::level::trace);
+      }
 
       m_num_cores = frontend->get_num_cores();
 
@@ -108,11 +154,13 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
       register_stat(s_read_latency).name("read_latency_{}", m_channel_id);
       register_stat(s_avg_read_latency).name("avg_read_latency_{}", m_channel_id);
+      register_stat(s_pim_tp_reqs).name("pim_tp_reqs_{}", m_channel_id);
+      register_stat(s_pim_tp_cycles).name("pim_tp_cycles_{}", m_channel_id);
+      register_stat(s_pim_tp_queue_len).name("pim_tp_queue_len_{}", m_channel_id);
+      register_stat(s_pim_tp_queue_len_avg).name("pim_tp_queue_len_avg_{}", m_channel_id);
     };
 
     bool send(Request& req) override {
-      req.final_command = m_dram->m_request_translations(req.type_id);
-
       switch (req.type_id) {
         case Request::Type::Read: {
           s_num_read_reqs++;
@@ -122,10 +170,18 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           s_num_write_reqs++;
           break;
         }
+        case Request::Type::PimTP: {
+          s_pim_tp_reqs++;
+          break;
+        }
         default: {
           s_num_other_reqs++;
           break;
         }
+      }
+
+      if (req.type_id != Request::Type::PimTP) {
+        req.final_command = m_dram->m_request_translations(req.type_id);
       }
 
       // Forward existing write requests to incoming read requests
@@ -148,6 +204,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         is_success = m_read_buffer.enqueue(req);
       } else if (req.type_id == Request::Type::Write) {
         is_success = m_write_buffer.enqueue(req);
+      } else if (req.type_id == Request::Type::PimTP) {
+        is_success = m_pim_buffer.enqueue(req);
       } else {
         throw std::runtime_error("Invalid request type!");
       }
@@ -176,9 +234,14 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       s_read_queue_len += m_read_buffer.size() + pending.size();
       s_write_queue_len += m_write_buffer.size();
       s_priority_queue_len += m_priority_buffer.size();
+      s_pim_tp_queue_len += m_pim_buffer.size() + m_pim_pending.size();
 
       // 1. Serve completed reads
       serve_completed_reads();
+      serve_completed_pim();
+
+      // 1.1 Schedule PIM requests on free banks
+      schedule_pim_requests();
 
       m_refresh->tick();
 
@@ -317,6 +380,61 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       };
     };
 
+    void serve_completed_pim() {
+      while (!m_pim_pending.empty()) {
+        auto& req = m_pim_pending.front();
+        if (req.depart > m_clk) {
+          break;
+        }
+        if (m_pim_tracer) {
+          int bank_id = req.addr_vec[m_bank_addr_idx];
+          m_pim_tracer->trace(
+            "{} {} {} {} {} {} {} {} {} {}",
+            m_pim_trace_id++,
+            req.pim_start,
+            req.depart,
+            m_channel_id,
+            bank_id,
+            req.pim_num_paths,
+            req.pim_dim_h,
+            req.pim_dim_e,
+            req.pim_dim_out,
+            req.pim_latency
+          );
+        }
+        s_pim_tp_cycles += req.pim_latency;
+        if (req.callback) {
+          req.callback(req);
+        }
+        m_pim_pending.pop_front();
+      }
+    }
+
+    void schedule_pim_requests() {
+      if (m_pim_buffer.size() == 0) {
+        return;
+      }
+
+      for (auto it = m_pim_buffer.begin(); it != m_pim_buffer.end();) {
+        int bank_id = it->addr_vec[m_bank_addr_idx];
+        if (bank_id < 0 || bank_id >= m_num_banks) {
+          throw std::runtime_error("Invalid bank id for PIM request.");
+        }
+        if (m_pim_bank_busy_until[bank_id] > m_clk) {
+          ++it;
+          continue;
+        }
+
+        Clk_t latency = compute_pim_latency(*it);
+        it->pim_start = m_clk;
+        it->pim_latency = latency;
+        it->depart = m_clk + latency;
+        m_pim_bank_busy_until[bank_id] = it->depart;
+        m_pim_pending.push_back(*it);
+        it = m_pim_buffer.buffer.erase(it);
+      }
+    }
+
 
     /**
      * @brief    Checks if we need to switch to write mode
@@ -334,6 +452,30 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       }
     };
 
+    bool is_pim_bank_busy(const AddrVec_t& addr_vec) const {
+      int bank_id = addr_vec[m_bank_addr_idx];
+      if (bank_id < 0 || bank_id >= m_num_banks) {
+        return false;
+      }
+      return m_pim_bank_busy_until[bank_id] > m_clk;
+    }
+
+    Clk_t compute_pim_latency(const Request& req) const {
+      int dim_h = req.pim_dim_h;
+      int dim_e = req.pim_dim_e;
+      int dim_out = req.pim_dim_out;
+      int num_paths = req.pim_num_paths;
+      if (dim_h <= 0 || dim_e <= 0 || dim_out <= 0 || num_paths <= 0) {
+        return m_pim_base_latency;
+      }
+
+      Clk_t outer_cost = static_cast<Clk_t>(dim_h) * dim_e;
+      Clk_t cg_cost = static_cast<Clk_t>(dim_out) * dim_h * dim_e;
+      Clk_t scale_cost = dim_out;
+      Clk_t per_path = m_pim_k_outer * outer_cost + m_pim_k_cg * cg_cost + m_pim_k_scale * scale_cost;
+      return m_pim_base_latency + per_path * num_paths;
+    }
+
 
     /**
      * @brief    Helper function to find a request to schedule from the buffers.
@@ -343,7 +485,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       bool request_found = false;
       // 2.1    First, check the act buffer to serve requests that are already activating (avoid useless ACTs)
       if (req_it= m_scheduler->get_best_request(m_active_buffer); req_it != m_active_buffer.end()) {
-        if (m_dram->check_ready(req_it->command, req_it->addr_vec)) {
+        if (m_dram->check_ready(req_it->command, req_it->addr_vec) && !is_pim_bank_busy(req_it->addr_vec)) {
           request_found = true;
           req_buffer = &m_active_buffer;
         }
@@ -357,7 +499,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           req_it = m_priority_buffer.begin();
           req_it->command = m_dram->get_preq_command(req_it->final_command, req_it->addr_vec);
           
-          request_found = m_dram->check_ready(req_it->command, req_it->addr_vec);
+          request_found = m_dram->check_ready(req_it->command, req_it->addr_vec) && !is_pim_bank_busy(req_it->addr_vec);
           if (!request_found & m_priority_buffer.size() != 0) {
             return false;
           }
@@ -369,7 +511,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           set_write_mode();
           auto& buffer = m_is_write_mode ? m_write_buffer : m_read_buffer;
           if (req_it = m_scheduler->get_best_request(buffer); req_it != buffer.end()) {
-            request_found = m_dram->check_ready(req_it->command, req_it->addr_vec);
+            request_found = m_dram->check_ready(req_it->command, req_it->addr_vec) && !is_pim_bank_busy(req_it->addr_vec);
             req_buffer = &buffer;
           }
         }
@@ -406,6 +548,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       s_read_queue_len_avg = (float) s_read_queue_len / (float) m_clk;
       s_write_queue_len_avg = (float) s_write_queue_len / (float) m_clk;
       s_priority_queue_len_avg = (float) s_priority_queue_len / (float) m_clk;
+      s_pim_tp_queue_len_avg = (float) s_pim_tp_queue_len / (float) m_clk;
 
       return;
     }
